@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"bytes"
 	"fmt"
 
 	"log"
@@ -31,7 +32,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -186,6 +187,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	buffer := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(buffer)
+	encoder.Encode(rf.currentTerm)
+	encoder.Encode(rf.votedFor)
+	encoder.Encode(rf.log)
+	data := buffer.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -208,6 +216,21 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	buffer := bytes.NewBuffer(data)
+	decoder := labgob.NewDecoder(buffer)
+	var currentTerm int
+	var votedFor int
+	var raftLog []LogEntry
+	if decoder.Decode(&currentTerm) != nil ||
+		decoder.Decode(&votedFor) != nil ||
+		decoder.Decode(&raftLog) != nil {
+		panic("readPersist failed")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = raftLog
+		Debug(dPersist,"S%d Recovered with currentTerm %d,votedFor %d,log%v",currentTerm,votedFor,raftLog)
+	}
 }
 
 //
@@ -264,6 +287,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	XTerm int
+	XIndex int
+	XLen int
 }
 
 func (rf *Raft) AtLeastUpToDate(LastLogIndex int, LastLogTerm int) bool {
@@ -281,7 +307,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	Debug(dVote, "S%d: got RequestVote from %d,with term %d,LastLogIndex %d,LastLogTerm %d",
 		rf.me, args.CandidateID,args.Term,args.LastLogIndex,args.LastLogTerm)
 	currentTerm := rf.currentTerm
-	rf.UpdateTermWithLock(args.Term, args.CandidateID)
+	rf.UpdateTermWithLock(args.Term, args.CandidateID,true)
 	reply.Term = currentTerm
 	reply.VoteGranted = false
 	if args.Term < currentTerm {
@@ -335,18 +361,31 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
 	reply.Success = true
+	reply.XTerm = -1
+	reply.XIndex = -1
+	reply.XLen = len(rf.log)
 	// reset election timer
 	rf.lastHeartBeat = time.Now()
 
-	if args.Term < rf.currentTerm || !rf.ContainsLogEntryAt(args.PrevLogIndex,args.PrevLogTerm) {
-		//if args.Term < rf.currentTerm {
-		//	Debug(dCommit,"S%d: reject AppendEntries with arg.Term %d currentTerm %d",
-		//		rf.me,args.Term,rf.currentTerm)
-		//} else {
-		//	Debug(dCommit,"S%d: reject AppendEntries with arg.PrevLogIndex %d args.PrevLogTerm %d",
-		//		rf.me,args.PrevLogIndex,args.PrevLogTerm)
-		//}
+	if args.Term < rf.currentTerm {
 		reply.Success = false
+		return
+	}
+
+	if !rf.ContainsLogEntryAt(args.PrevLogIndex,args.PrevLogTerm) {
+		reply.Success = false
+		lastIndex := len(rf.log) - 1
+		// XTerm: term in the conflicting entry (if any)
+		// XIndex: index of first entry with that term (if any)
+		// XLen:   log length
+		if args.PrevLogIndex >= 0 && args.PrevLogIndex <= lastIndex {
+			reply.XTerm = rf.log[args.PrevLogIndex].Term
+			index := args.PrevLogIndex
+			for index >= 0 && rf.log[index].Term == reply.XTerm {
+				reply.XIndex = index
+				index--
+			}
+		}
 		return
 	}
 
@@ -373,7 +412,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	Debug(dLog,"S%d: log after replication %v",rf.me,rf.log)
 
 
-	rf.UpdateTermWithLock(args.Term, args.LeaderId)
+	rf.UpdateTermWithLock(args.Term, args.LeaderId,false)
+	rf.persist()
 }
 
 func min(a int, b int) int{
@@ -458,6 +498,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Command: command,
 			Term:    term,
 		})
+		rf.persist()
 		Debug(dLeader, "S%d: receive command from client, with term %d", rf.me,term)
 		Debug(dLeader,"S%d: current log %v",rf.me,rf.log)
 	}
@@ -498,7 +539,7 @@ func (rf *Raft) majority() int {
 }
 
 // should hold rf.mu before calling this function
-func (rf *Raft) UpdateTermWithLock(term int, peerID int) {
+func (rf *Raft) UpdateTermWithLock(term int, peerID int,doPersist bool) {
 	if rf.currentTerm >= term {
 		return
 	} else {
@@ -507,6 +548,9 @@ func (rf *Raft) UpdateTermWithLock(term int, peerID int) {
 		rf.state = Follower
 		// empty voteFor in new term
 		rf.votedFor = -1
+		if doPersist {
+			rf.persist()
+		}
 	}
 }
 
@@ -545,7 +589,7 @@ func (rf *Raft) startElection() {
 				Debug(dVote, "S%d: sending RequestVote to %d", rf.me, peerID)
 				ok := rf.sendRequestVote(peerID, args, reply)
 				rf.mu.Lock()
-				rf.UpdateTermWithLock(reply.Term, peerID)
+				rf.UpdateTermWithLock(reply.Term, peerID,true)
 				rf.mu.Unlock()
 				mu.Lock()
 				defer mu.Unlock()
@@ -661,12 +705,23 @@ func (rf *Raft) BroadcastAppendEntries() {
 					rf.matchIndex[peerID] = prevLogIndex + len(entries)
 				} else {
 					Debug(dLog2,"S%d: AppendEntries to S%d failed",rf.me,peerID)
-					// in case a crashed follower makes nextIndex a negative number
-					if rf.nextIndex[peerID] > 1 {
-						rf.nextIndex[peerID]--
+					if reply.XTerm == -1 {
+						// follower's log is too short
+						rf.nextIndex[peerID] = reply.XLen
+					} else {
+						index := rf.lastIndexForTerm(reply.XTerm)
+						if index == -1 {
+							// leader doesn't have XTerm
+							rf.nextIndex[peerID] = reply.XIndex
+						} else {
+							// leader has XTerm
+							rf.nextIndex[peerID] = index
+						}
 					}
+					// in case nextIndex exceed len(rf.log)
+					rf.nextIndex[peerID] = min(rf.nextIndex[peerID],len(rf.log))
 				}
-				rf.UpdateTermWithLock(reply.Term, peerID)
+				rf.UpdateTermWithLock(reply.Term, peerID,true)
 				rf.mu.Unlock()
 			}(peerID)
 		}
@@ -724,6 +779,15 @@ func (rf *Raft)InitNextAndMatch() {
 	}
 }
 
+func (rf *Raft) lastIndexForTerm(term int) int {
+	for i := len(rf.log) - 1; i >= 0; i-- {
+		if rf.log[i].Term == term {
+			return i
+		}
+	}
+	return -1
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -761,9 +825,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		Term:    0,
 	})
 
+	rf.readPersist(persister.ReadRaftState())
 	// initialize from state persisted before a crash
 	rf.InitNextAndMatch()
-	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
