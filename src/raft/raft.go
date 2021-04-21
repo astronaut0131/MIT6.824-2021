@@ -434,9 +434,10 @@ func (rf *Raft) ApplySnapshot(msg ApplyMsg) {
 
 func (rf *Raft) CheckApplyPeriodically() {
 	for !rf.killed() {
-		time.Sleep(time.Duration(HeartBeatTimeout) * time.Millisecond)
+		time.Sleep(time.Duration(HeartBeatTimeout/4) * time.Millisecond)
 		rf.mu.Lock()
-		Debug(dLog, "S%d: term %d commit %d offset %d lastApplied %d,log %v", rf.me, rf.currentTerm, rf.commitIndex, rf.getOffset(),rf.lastApplied,rf.log)
+		rf.TryUpdateCommit()
+		//Debug(dLog, "S%d: term %d commit %d offset %d lastApplied %d,log %v", rf.me, rf.currentTerm, rf.commitIndex, rf.getOffset(),rf.lastApplied,rf.log)
 		for rf.lastApplied < rf.commitIndex {
 			rf.lastApplied++
 			msg := ApplyMsg{
@@ -820,8 +821,6 @@ func (rf *Raft) CanCommit(index int) bool {
 }
 
 func (rf *Raft) TryUpdateCommit() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	left := rf.commitIndex
 	right := rf.getLastIndex()
 	for i := right; i >= left; i-- {
@@ -922,7 +921,6 @@ func (rf *Raft) LogReplicationTo(peerID int) {
 }
 
 func (rf *Raft) BroadcastLogReplication() {
-	rf.TryUpdateCommit()
 	for peerID := range rf.peers {
 		if peerID != rf.me {
 			go func(peerID int) {
