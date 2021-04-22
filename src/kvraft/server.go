@@ -22,6 +22,7 @@ import (
 )
 
 const Debug = false
+const Timeout = 700
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -65,7 +66,6 @@ type KVServer struct {
 	// Your definitions here.
 	kvMap       map[string]string
 	chanMap     map[int64]chan OpResult
-	indexMap    map[int]int64
 	seenReplies map[int64]OpResult
 }
 
@@ -77,43 +77,34 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		Value:     "",
 		CommandID: args.CommandID,
 	}
-	//for true {
-	//	kv.mu.Lock()
-	//	_,ok := kv.chanMap[args.CommandID]
-	//	if ok {
-	//		time.Sleep(time.Duration(100) * time.Millisecond)
-	//	} else {
-	//		kv.mu.Unlock()
-	//		break
-	//	}
-	//	kv.mu.Unlock()
-	//}
-	//DPrintf("start commandID %d",op.CommandID)
-	index, _, isLeader := kv.rf.Start(op)
+	_, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		reply.Value = ""
 		return
 	}
-	DPrintf("S%d waiting for lock", kv.me)
 	kv.mu.Lock()
-	DPrintf("S%d waiting for lockok", kv.me)
-	ch := make(chan OpResult)
-	kv.chanMap[args.CommandID] = ch
-	kv.indexMap[index] = args.CommandID
-	kv.mu.Unlock()
-
-	DPrintf("S%d waiting for chan", kv.me)
-	opResult := <-ch
-
-	DPrintf("S%d waiting for chan ok", kv.me)
-	if opResult.error == ErrWrongLeader {
-		panic("should not get ErrWrongLeader from OpResult")
+	ch, ok := kv.chanMap[args.CommandID]
+	if !ok {
+		ch = make(chan OpResult)
+		kv.chanMap[args.CommandID] = ch
 	}
-	kv.deleteChanAndIndex(args.CommandID, index)
-	reply.Err = opResult.error
-	reply.Value = opResult.value
-
+	kv.mu.Unlock()
+	select {
+	case opResult := <-ch:
+		{
+			if opResult.error == ErrWrongLeader {
+				panic("should not get ErrWrongLeader from OpResult")
+			}
+			reply.Err = opResult.error
+			reply.Value = opResult.value
+		}
+	case <-time.After(time.Duration(Timeout) * time.Millisecond):
+		{
+			reply.Err = ErrFailed
+			reply.Value = ""
+		}
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -130,36 +121,31 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		Value:     args.Value,
 		CommandID: args.CommandID,
 	}
-	//for true {
-	//	kv.mu.Lock()
-	//	_,ok := kv.chanMap[args.CommandID]
-	//	if ok {
-	//		time.Sleep(time.Duration(100) * time.Millisecond)
-	//	} else {
-	//		kv.mu.Unlock()
-	//		break
-	//	}
-	//	kv.mu.Unlock()
-	//}
-	//DPrintf("start commandID %d",op.CommandID)
-	index, _, isLeader := kv.rf.Start(op)
+	_, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
 	kv.mu.Lock()
-	ch := make(chan OpResult)
-	kv.chanMap[args.CommandID] = ch
-	kv.indexMap[index] = args.CommandID
-	kv.mu.Unlock()
-	DPrintf("S%d waiting for chan index %d", kv.me, index)
-	opResult := <-ch
-	DPrintf("S%d waiting for chan ok", kv.me)
-	if opResult.error == ErrWrongLeader {
-		panic("should not get ErrWrongLeader from OpResult")
+	ch, ok := kv.chanMap[args.CommandID]
+	if !ok {
+		ch = make(chan OpResult)
+		kv.chanMap[args.CommandID] = ch
 	}
-	kv.deleteChanAndIndex(args.CommandID, index)
-	reply.Err = opResult.error
+	kv.mu.Unlock()
+	select {
+	case opResult := <-ch:
+		{
+			if opResult.error == ErrWrongLeader {
+				panic("should not get ErrWrongLeader from OpResult")
+			}
+			reply.Err = opResult.error
+		}
+	case <-time.After(time.Duration(Timeout) * time.Millisecond):
+		{
+			reply.Err = ErrFailed
+		}
+	}
 }
 
 //
@@ -192,32 +178,6 @@ func (kv *KVServer) Apply() {
 			}
 			DPrintf("state machine get index %d", msg.CommandIndex)
 			kv.mu.Lock()
-			originCommandID, ok := kv.indexMap[msg.CommandIndex]
-			if ok && originCommandID != op.CommandID {
-				ch, hasCh := kv.chanMap[originCommandID]
-				if hasCh {
-					kv.mu.Unlock()
-
-					select {
-					case ch <- OpResult{
-						error: ErrFailed,
-						value: "",
-					}:
-						{
-
-						}
-					case <-time.After(time.Duration(100) * time.Millisecond):
-						{
-
-						}
-					}
-					//ch <- OpResult{
-					//	error: "ErrFailed",
-					//	value: "",
-					//}
-					kv.mu.Lock()
-				}
-			}
 			opResult, seen := kv.seenReplies[op.CommandID]
 			ch, hasCh := kv.chanMap[op.CommandID]
 			if !seen {
@@ -249,7 +209,6 @@ func (kv *KVServer) Apply() {
 			}
 			kv.mu.Unlock()
 			if hasCh {
-				DPrintf("blocking S%d", kv.me)
 				select {
 				case ch <- opResult:
 					{
@@ -260,8 +219,6 @@ func (kv *KVServer) Apply() {
 
 					}
 				}
-				//ch <- opResult
-				DPrintf("finish blocking S%d", kv.me)
 			}
 		} else if msg.SnapshotValid {
 
@@ -271,12 +228,6 @@ func (kv *KVServer) Apply() {
 	}
 }
 
-func (kv *KVServer) deleteChanAndIndex(id int64, index int) {
-	kv.mu.Lock()
-	delete(kv.chanMap, id)
-	delete(kv.indexMap, index)
-	kv.mu.Unlock()
-}
 
 //
 // servers[] contains the ports of the set of
@@ -308,7 +259,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 	kv.chanMap = make(map[int64]chan OpResult)
 	kv.kvMap = make(map[string]string)
-	kv.indexMap = make(map[int]int64)
 	kv.seenReplies = make(map[int64]OpResult)
 	go kv.Apply()
 	return kv
