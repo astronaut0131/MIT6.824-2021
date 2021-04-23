@@ -249,6 +249,8 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.snapshot.LastIncludedIndex = lastIncludedIndex
 		rf.snapshot.LastIncludedTerm = lastIncludedTerm
 		rf.snapshot.data = rf.persister.ReadSnapshot()
+		rf.lastInstalledTerm = lastIncludedTerm
+		rf.lastInstalledIndex = lastIncludedIndex
 		Debug(dPersist, "S%d Recovered with currentTerm %d,votedFor %d,log%v", currentTerm, votedFor, raftLog)
 	}
 }
@@ -278,6 +280,11 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	rf.lastInstalledTerm = lastIncludedTerm
 	rf.commitIndex = max(rf.commitIndex,rf.lastInstalledIndex)
 	rf.lastApplied = max(rf.lastApplied,rf.lastInstalledIndex)
+	rf.snapshot = Snapshot{
+		LastIncludedIndex: lastIncludedTerm,
+		LastIncludedTerm:  lastIncludedTerm,
+		data:              snapshot,
+	}
 	rf.persist()
 	return true
 }
@@ -315,7 +322,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// index = 8
 	// [0]
 	// [5]
-
+	//println("offsetIndex ",offsetIndex)
 	lastInstalledTerm := rf.log[index-offsetIndex].Term
 
 	//Debug(dSnap,"S%d before trim %v",rf.me,rf.log)
@@ -328,7 +335,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.snapshot.LastIncludedIndex = index
 	rf.snapshot.LastIncludedTerm = rf.lastInstalledTerm
 	rf.persist()
-
+	//println("finish persisiting offset ",rf.getOffset())
 }
 
 type InstallSnapshotArgs struct {
@@ -436,20 +443,27 @@ func (rf *Raft) CheckApplyPeriodically() {
 	for !rf.killed() {
 		time.Sleep(time.Duration(HeartBeatTimeout/4) * time.Millisecond)
 		rf.mu.Lock()
-		rf.TryUpdateCommit()
-		//Debug(dLog, "S%d: term %d commit %d offset %d lastApplied %d,log %v", rf.me, rf.currentTerm, rf.commitIndex, rf.getOffset(),rf.lastApplied,rf.log)
-		for rf.lastApplied < rf.commitIndex {
-			rf.lastApplied++
-			msg := ApplyMsg{
-				CommandValid: true,
-				Command:      rf.getCommandAt(rf.lastApplied),
-				CommandIndex: rf.lastApplied,
-			}
-			Debug(dCommit, "S%d: apply index %d command %d to state machine, commit index %d", rf.me, rf.lastApplied,
-				rf.getCommandAt(rf.lastApplied),rf.commitIndex)
+		if rf.lastApplied < rf.lastInstalledIndex {
+			msg := rf.MakeSnapshotMsg()
 			rf.mu.Unlock()
-			rf.applyCh <- msg
+			rf.ApplySnapshot(msg)
 			rf.mu.Lock()
+		} else {
+			rf.TryUpdateCommit()
+			//Debug(dLog, "S%d: term %d commit %d offset %d lastApplied %d,log %v", rf.me, rf.currentTerm, rf.commitIndex, rf.getOffset(),rf.lastApplied,rf.log)
+			for rf.lastApplied < rf.commitIndex {
+				rf.lastApplied++
+				msg := ApplyMsg{
+					CommandValid: true,
+					Command:      rf.getCommandAt(rf.lastApplied),
+					CommandIndex: rf.lastApplied,
+				}
+				Debug(dCommit, "S%d: apply index %d command %d to state machine, commit index %d", rf.me, rf.lastApplied,
+					rf.getCommandAt(rf.lastApplied), rf.commitIndex)
+				rf.mu.Unlock()
+				rf.applyCh <- msg
+				rf.mu.Lock()
+			}
 		}
 		rf.mu.Unlock()
 	}
@@ -708,7 +722,14 @@ func (rf *Raft) getLastTerm() int{
 }
 
 func (rf *Raft) getTrueIndex(index int) int {
+	trueIndex := index - rf.getOffset()
+	if trueIndex < 0 {
+		return 0
+	}
 	return index - rf.getOffset()
+}
+func (rf *Raft) GetTermAt(index int)int {
+	return rf.getTermAt(index)
 }
 
 func (rf *Raft) getTermAt(index int) int{
@@ -994,18 +1015,6 @@ func (rf *Raft) lastIndexForTerm(term int) int {
 	return -1
 }
 
-func (rf *Raft) InitSnapshot() {
-	time.Sleep(time.Duration(HeartBeatTimeout) * time.Millisecond)
-	rf.mu.Lock()
-	if rf.snapshot.LastIncludedIndex != -1 && rf.lastInstalledIndex < rf.snapshot.LastIncludedIndex {
-		Debug(dSnap,"S%d apply init snapshot, included index %d, included term %d",rf.me,rf.snapshot.LastIncludedIndex,rf.snapshot.LastIncludedTerm)
-		msg := rf.MakeSnapshotMsg()
-		rf.mu.Unlock()
-		rf.ApplySnapshot(msg)
-		rf.mu.Lock()
-	}
-	rf.mu.Unlock()
-}
 
 //
 // the service or tester wants to create a Raft server. the ports
@@ -1054,10 +1063,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 	// initialize nextIndex and matchIndex to ideal length
 	rf.InitNextAndMatch()
-	go rf.InitSnapshot()
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.CheckApplyPeriodically()
-
 	return rf
 }

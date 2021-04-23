@@ -18,6 +18,7 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	LastOKCommandID int64
 }
 
 type PutAppendReply struct {
@@ -28,9 +29,11 @@ type GetArgs struct {
 	Key string
 	CommandID int64
 	// You'll have to add definitions here.
+	LastOKCommandID int64
 }
 
 type GetReply struct {
 	Err   Err
 	Value string
+	CommandID int64
 }

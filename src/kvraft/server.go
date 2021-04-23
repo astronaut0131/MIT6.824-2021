@@ -4,21 +4,11 @@ import (
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
-	"time"
-
-	//"time"
-
-	//"fmt"
-	//"time"
-
-	//"fmt"
-	//"time"
-
-	//"fmt"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
-	//"time"
+	"time"
 )
 
 const Debug = false
@@ -40,8 +30,8 @@ const (
 )
 
 type OpResult struct {
-	error Err
-	value string
+	Error Err
+	Value string
 }
 
 type Op struct {
@@ -67,6 +57,7 @@ type KVServer struct {
 	kvMap       map[string]string
 	chanMap     map[int64]chan OpResult
 	seenReplies map[int64]OpResult
+	persister 	*raft.Persister
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -84,20 +75,31 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 	kv.mu.Lock()
+	//opResult, seen := kv.seenReplies[op.CommandID]
+	//if seen{
+	//	reply.Err = opResult.Error
+	//	reply.Value = opResult.Value
+	//	kv.mu.Unlock()
+	//	return
+	//}
 	ch, ok := kv.chanMap[args.CommandID]
 	if !ok {
 		ch = make(chan OpResult)
 		kv.chanMap[args.CommandID] = ch
+	} else {
+		reply.Err = ErrFailed
+		kv.mu.Unlock()
+		return
 	}
 	kv.mu.Unlock()
 	select {
 	case opResult := <-ch:
 		{
-			if opResult.error == ErrWrongLeader {
+			if opResult.Error == ErrWrongLeader {
 				panic("should not get ErrWrongLeader from OpResult")
 			}
-			reply.Err = opResult.error
-			reply.Value = opResult.value
+			reply.Err = opResult.Error
+			reply.Value = opResult.Value
 		}
 	case <-time.After(time.Duration(Timeout) * time.Millisecond):
 		{
@@ -105,6 +107,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 			reply.Value = ""
 		}
 	}
+	kv.deleteChanAndLast(op.CommandID,args.LastOKCommandID)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -127,25 +130,36 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 	kv.mu.Lock()
+	//opResult, seen := kv.seenReplies[op.CommandID]
+	//if seen{
+	//	reply.Err = opResult.Error
+	//	kv.mu.Unlock()
+	//	return
+	//}
 	ch, ok := kv.chanMap[args.CommandID]
 	if !ok {
 		ch = make(chan OpResult)
 		kv.chanMap[args.CommandID] = ch
+	} else {
+		reply.Err = ErrFailed
+		kv.mu.Unlock()
+		return
 	}
 	kv.mu.Unlock()
 	select {
 	case opResult := <-ch:
 		{
-			if opResult.error == ErrWrongLeader {
+			if opResult.Error == ErrWrongLeader {
 				panic("should not get ErrWrongLeader from OpResult")
 			}
-			reply.Err = opResult.error
+			reply.Err = opResult.Error
 		}
 	case <-time.After(time.Duration(Timeout) * time.Millisecond):
 		{
 			reply.Err = ErrFailed
 		}
 	}
+	kv.deleteChanAndLast(op.CommandID,args.LastOKCommandID)
 }
 
 //
@@ -171,26 +185,38 @@ func (kv *KVServer) killed() bool {
 
 func (kv *KVServer) Apply() {
 	for msg := range kv.applyCh {
+		// check whether to generate a snapshot
+		if kv.rf != nil && kv.maxraftstate != -1 && kv.persister.RaftStateSize() + 500 > kv.maxraftstate {
+			kv.mu.Lock()
+			lastIndex := msg.CommandIndex - 1
+			data := kv.genSnapshot(lastIndex,kv.rf.GetTermAt(lastIndex))
+			DPrintf("S%d making snapshot, with index %d",kv.me,lastIndex)
+			kv.rf.Snapshot(lastIndex,data)
+			kv.mu.Unlock()
+		}
 		if msg.CommandValid {
 			op, assertOk := msg.Command.(Op)
 			if !assertOk {
 				panic("invalid command")
 			}
-			DPrintf("state machine get index %d", msg.CommandIndex)
+			DPrintf("S%d state machine get index %d", kv.me,msg.CommandIndex)
 			kv.mu.Lock()
+			//if op.OpType == APPEND {
+			//	println(kv.me,"applying append ",op.Value, "\n")
+			//}
 			opResult, seen := kv.seenReplies[op.CommandID]
 			ch, hasCh := kv.chanMap[op.CommandID]
 			if !seen {
-				opResult.error = ErrFailed
-				opResult.value = ""
+				opResult.Error = ErrFailed
+				opResult.Value = ""
 				if op.OpType == GET {
 					value, ok := kv.kvMap[op.Key]
 					if ok {
-						opResult.error = OK
-						opResult.value = value
+						opResult.Error = OK
+						opResult.Value = value
 					} else {
-						opResult.error = ErrNoKey
-						opResult.value = ""
+						opResult.Error = ErrNoKey
+						opResult.Value = ""
 					}
 				} else {
 					value, ok := kv.kvMap[op.Key]
@@ -203,7 +229,7 @@ func (kv *KVServer) Apply() {
 							kv.kvMap[op.Key] = op.Value
 						}
 					}
-					opResult.error = OK
+					opResult.Error = OK
 				}
 				kv.seenReplies[op.CommandID] = opResult
 			}
@@ -221,18 +247,50 @@ func (kv *KVServer) Apply() {
 				}
 			}
 		} else if msg.SnapshotValid {
-
+			//println(kv.me,"receive snapshot apply")
+			if kv.rf.CondInstallSnapshot(msg.SnapshotTerm,msg.SnapshotIndex,msg.Snapshot) {
+				buffer := bytes.NewBuffer(msg.Snapshot)
+				decoder := labgob.NewDecoder(buffer)
+				kv.mu.Lock()
+				//if decoder.Decode(&kv.kvMap) != nil {
+				//	panic("decode failed in server")
+				//}
+				var index int
+				var term int
+				if decoder.Decode(&index) != nil || decoder.Decode(&term) != nil || decoder.Decode(&kv.seenReplies) != nil || decoder.Decode(&kv.kvMap) != nil {
+					panic("decode failed in server")
+				}
+				kv.mu.Unlock()
+			}
 		} else {
 			panic("applyCh receives an invalid msg")
 		}
 	}
 }
 
+func (kv *KVServer) genSnapshot(index int,term int) []byte {
+	buffer := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(buffer)
+	encoder.Encode(index)
+	encoder.Encode(term)
+	encoder.Encode(kv.seenReplies)
+	encoder.Encode(kv.kvMap)
+	data := buffer.Bytes()
+	return data
+}
+
+func (kv *KVServer) deleteChanAndLast(id int64,lastId int64) {
+	kv.mu.Lock()
+	//delete(kv.seenReplies,lastId)
+	delete(kv.chanMap,id)
+	kv.mu.Unlock()
+}
+
 
 //
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
-// form the fault-tolerant key/value service.
+// form the fault-tolerant key/Value service.
 // me is the index of the current server in servers[].
 // the k/v server should store snapshots through the underlying Raft
 // implementation, which should call persister.SaveStateAndSnapshot() to
@@ -253,13 +311,18 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
-	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	// read the snapshot and recover
 
 	// You may need initialization code here.
 	kv.chanMap = make(map[int64]chan OpResult)
 	kv.kvMap = make(map[string]string)
 	kv.seenReplies = make(map[int64]OpResult)
+	kv.persister = persister
+	kv.applyCh = make(chan raft.ApplyMsg)
+
 	go kv.Apply()
+	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+
+	//fmt.Printf("server %d start with map %v\n", kv.me, kv.kvMap)
 	return kv
 }
