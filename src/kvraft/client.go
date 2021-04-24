@@ -28,14 +28,11 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	return ck
 }
 
-func (ck *Clerk) GetNextCounter() int64{
-	var ret int64
+func (ck *Clerk) GetNextCounter() int{
 	ck.mu.Lock()
-	ret += int64(ck.counter)
-	ret <<= 32
+	ret := ck.counter
 	ck.counter++
 	ck.mu.Unlock()
-	ret += int64(ck.me)
 	return ret
 }
 
@@ -57,7 +54,7 @@ func (ck *Clerk) Get(key string) string {
 	args := &GetArgs{
 		Key: key,
 		CommandID: commandID,
-		LastOKCommandID: ck.lastOKCommandID,
+		ClientID: ck.me,
 	}
 	for true {
 		for ID := ck.leaderID; ID != ck.leaderID + len(ck.servers); ID++ {
@@ -70,7 +67,6 @@ func (ck *Clerk) Get(key string) string {
 				case OK:
 					{
 						ck.leaderID = serverID
-						ck.lastOKCommandID = commandID
 						return reply.Value
 					}
 				case ErrNoKey:
@@ -104,7 +100,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		Value: value,
 		Op:    op,
 		CommandID: commandID,
-		LastOKCommandID: ck.lastOKCommandID,
+		ClientID: ck.me,
 	}
 	for true {
 		for ID := ck.leaderID; ID != ck.leaderID + len(ck.servers); ID++ {
@@ -116,7 +112,6 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				DPrintf("Receive %s from S%d",reply.Err,serverID)
 				if reply.Err == OK {
 					ck.leaderID = serverID
-					ck.lastOKCommandID = commandID
 					return
 				} else {
 					continue

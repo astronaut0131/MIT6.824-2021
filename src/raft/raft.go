@@ -441,7 +441,7 @@ func (rf *Raft) ApplySnapshot(msg ApplyMsg) {
 
 func (rf *Raft) CheckApplyPeriodically() {
 	for !rf.killed() {
-		time.Sleep(time.Duration(HeartBeatTimeout/4) * time.Millisecond)
+		time.Sleep(time.Duration(HeartBeatTimeout/6) * time.Millisecond)
 		rf.mu.Lock()
 		if rf.lastApplied < rf.lastInstalledIndex {
 			msg := rf.MakeSnapshotMsg()
@@ -639,7 +639,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
 	isLeader := true
-
+	offset := -1
 	// Your code here (2B).
 	rf.mu.Lock()
 	isLeader = rf.state == Leader
@@ -653,13 +653,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.persist()
 		Debug(dLeader, "S%d: receive command from client, with term %d", rf.me, term)
 		Debug(dLeader, "S%d: current log %v", rf.me, rf.log)
+		offset = rf.getOffset()
 	}
 	rf.mu.Unlock()
 
 	if isLeader {
 		rf.BroadcastLogReplication()
 	}
-	return rf.getOffset() + index, term, isLeader
+	return offset + index, term, isLeader
 }
 
 //
@@ -727,9 +728,6 @@ func (rf *Raft) getTrueIndex(index int) int {
 		return 0
 	}
 	return index - rf.getOffset()
-}
-func (rf *Raft) GetTermAt(index int)int {
-	return rf.getTermAt(index)
 }
 
 func (rf *Raft) getTermAt(index int) int{

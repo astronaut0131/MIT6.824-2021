@@ -41,7 +41,8 @@ type Op struct {
 	OpType    OpType
 	Key       string
 	Value     string
-	CommandID int64
+	CommandID int
+	ClientID  int
 }
 
 type KVServer struct {
@@ -56,17 +57,36 @@ type KVServer struct {
 	// Your definitions here.
 	kvMap       map[string]string
 	chanMap     map[int64]chan OpResult
-	seenReplies map[int64]OpResult
+	maxClientCommandID	map[int]int
+	seenReplies map[int]OpResult
 	persister 	*raft.Persister
 }
 
+func (kv *KVServer) CombineID(clientID int,commandID int) int64{
+	var ret int64
+	ret += int64(clientID)
+	ret <<= 32
+	ret += int64(commandID)
+	return ret
+}
+
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
+	kv.mu.Lock()
+	maxCommandID,ok := kv.maxClientCommandID[args.ClientID]
+	if ok && maxCommandID > args.CommandID {
+		reply.Err = kv.seenReplies[args.ClientID].Error
+		reply.Value = kv.seenReplies[args.ClientID].Value
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
 	// Your code here.
 	op := Op{
 		OpType:    GET,
 		Key:       args.Key,
 		Value:     "",
 		CommandID: args.CommandID,
+		ClientID: args.ClientID,
 	}
 	_, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
@@ -75,18 +95,13 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 	kv.mu.Lock()
-	//opResult, seen := kv.seenReplies[op.CommandID]
-	//if seen{
-	//	reply.Err = opResult.Error
-	//	reply.Value = opResult.Value
-	//	kv.mu.Unlock()
-	//	return
-	//}
-	ch, ok := kv.chanMap[args.CommandID]
+	combineID := kv.CombineID(args.ClientID,args.CommandID)
+	ch, ok := kv.chanMap[combineID]
 	if !ok {
 		ch = make(chan OpResult)
-		kv.chanMap[args.CommandID] = ch
+		kv.chanMap[combineID] = ch
 	} else {
+		// there is already such a command in this server
 		reply.Err = ErrFailed
 		kv.mu.Unlock()
 		return
@@ -107,10 +122,18 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 			reply.Value = ""
 		}
 	}
-	kv.deleteChanAndLast(op.CommandID,args.LastOKCommandID)
+	kv.deleteChan(combineID)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+	kv.mu.Lock()
+	maxCommandID,ok := kv.maxClientCommandID[args.ClientID]
+	if ok && maxCommandID > args.CommandID {
+		reply.Err = kv.seenReplies[args.ClientID].Error
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
 	// Your code here.
 	var opType OpType
 	if args.Op == "Put" {
@@ -123,23 +146,19 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		Key:       args.Key,
 		Value:     args.Value,
 		CommandID: args.CommandID,
+		ClientID: args.ClientID,
 	}
 	_, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
+	combineID := kv.CombineID(args.ClientID,args.CommandID)
 	kv.mu.Lock()
-	//opResult, seen := kv.seenReplies[op.CommandID]
-	//if seen{
-	//	reply.Err = opResult.Error
-	//	kv.mu.Unlock()
-	//	return
-	//}
-	ch, ok := kv.chanMap[args.CommandID]
+	ch, ok := kv.chanMap[combineID]
 	if !ok {
 		ch = make(chan OpResult)
-		kv.chanMap[args.CommandID] = ch
+		kv.chanMap[combineID] = ch
 	} else {
 		reply.Err = ErrFailed
 		kv.mu.Unlock()
@@ -159,7 +178,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			reply.Err = ErrFailed
 		}
 	}
-	kv.deleteChanAndLast(op.CommandID,args.LastOKCommandID)
+	kv.deleteChan(combineID)
 }
 
 //
@@ -185,11 +204,14 @@ func (kv *KVServer) killed() bool {
 
 func (kv *KVServer) Apply() {
 	for msg := range kv.applyCh {
+		if kv.killed() {
+			return
+		}
 		// check whether to generate a snapshot
 		if kv.rf != nil && kv.maxraftstate != -1 && kv.persister.RaftStateSize() + 500 > kv.maxraftstate {
 			kv.mu.Lock()
 			lastIndex := msg.CommandIndex - 1
-			data := kv.genSnapshot(lastIndex,kv.rf.GetTermAt(lastIndex))
+			data := kv.genSnapshot()
 			DPrintf("S%d making snapshot, with index %d",kv.me,lastIndex)
 			kv.rf.Snapshot(lastIndex,data)
 			kv.mu.Unlock()
@@ -204,9 +226,13 @@ func (kv *KVServer) Apply() {
 			//if op.OpType == APPEND {
 			//	println(kv.me,"applying append ",op.Value, "\n")
 			//}
-			opResult, seen := kv.seenReplies[op.CommandID]
-			ch, hasCh := kv.chanMap[op.CommandID]
-			if !seen {
+
+			maxCommandID,ok := kv.maxClientCommandID[op.ClientID]
+			var opResult OpResult
+			ch, hasCh := kv.chanMap[kv.CombineID(op.ClientID,op.CommandID)]
+			if ok && maxCommandID > op.CommandID {
+				opResult = kv.seenReplies[op.ClientID]
+			} else {
 				opResult.Error = ErrFailed
 				opResult.Value = ""
 				if op.OpType == GET {
@@ -231,7 +257,8 @@ func (kv *KVServer) Apply() {
 					}
 					opResult.Error = OK
 				}
-				kv.seenReplies[op.CommandID] = opResult
+				kv.seenReplies[op.ClientID] = opResult
+				kv.maxClientCommandID[op.ClientID]++
 			}
 			kv.mu.Unlock()
 			if hasCh {
@@ -252,12 +279,7 @@ func (kv *KVServer) Apply() {
 				buffer := bytes.NewBuffer(msg.Snapshot)
 				decoder := labgob.NewDecoder(buffer)
 				kv.mu.Lock()
-				//if decoder.Decode(&kv.kvMap) != nil {
-				//	panic("decode failed in server")
-				//}
-				var index int
-				var term int
-				if decoder.Decode(&index) != nil || decoder.Decode(&term) != nil || decoder.Decode(&kv.seenReplies) != nil || decoder.Decode(&kv.kvMap) != nil {
+				if decoder.Decode(&kv.maxClientCommandID) != nil || decoder.Decode(&kv.seenReplies) != nil || decoder.Decode(&kv.kvMap) != nil {
 					panic("decode failed in server")
 				}
 				kv.mu.Unlock()
@@ -268,20 +290,18 @@ func (kv *KVServer) Apply() {
 	}
 }
 
-func (kv *KVServer) genSnapshot(index int,term int) []byte {
+func (kv *KVServer) genSnapshot() []byte {
 	buffer := new(bytes.Buffer)
 	encoder := labgob.NewEncoder(buffer)
-	encoder.Encode(index)
-	encoder.Encode(term)
+	encoder.Encode(kv.maxClientCommandID)
 	encoder.Encode(kv.seenReplies)
 	encoder.Encode(kv.kvMap)
 	data := buffer.Bytes()
 	return data
 }
 
-func (kv *KVServer) deleteChanAndLast(id int64,lastId int64) {
+func (kv *KVServer) deleteChan(id int64) {
 	kv.mu.Lock()
-	//delete(kv.seenReplies,lastId)
 	delete(kv.chanMap,id)
 	kv.mu.Unlock()
 }
@@ -316,13 +336,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 	kv.chanMap = make(map[int64]chan OpResult)
 	kv.kvMap = make(map[string]string)
-	kv.seenReplies = make(map[int64]OpResult)
+	kv.seenReplies = make(map[int]OpResult)
+	kv.maxClientCommandID = make(map[int]int)
 	kv.persister = persister
 	kv.applyCh = make(chan raft.ApplyMsg)
 
-	go kv.Apply()
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
+	go kv.Apply()
 	//fmt.Printf("server %d start with map %v\n", kv.me, kv.kvMap)
 	return kv
 }
