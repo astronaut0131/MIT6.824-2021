@@ -126,6 +126,7 @@ type LogEntry struct {
 	Command interface{}
 	Term    int
 }
+
 type State int
 
 const (
@@ -263,12 +264,12 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	// Your code here (2D).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	Debug(dSnap,"S%d CondInstallSnapshot called,included index %d,included term %d",rf.me,lastIncludedIndex,lastIncludedTerm)
+	Debug(dSnap, "S%d CondInstallSnapshot called,included index %d,included term %d", rf.me, lastIncludedIndex, lastIncludedTerm)
 	// if Raft has processed entries after
 	// the snapshot's LastIncludedTerm/LastIncludedIndex
 	// refuse the installation
 	if rf.lastApplied > lastIncludedIndex ||
-		(rf.lastApplied == lastIncludedIndex && rf.getTermAt(rf.lastApplied) >= lastIncludedTerm){
+		(rf.lastApplied == lastIncludedIndex && rf.getTermAt(rf.lastApplied) >= lastIncludedTerm) {
 		return false
 	}
 
@@ -309,7 +310,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	defer rf.mu.Unlock()
 	Debug(dSnap,"S%d Snapshot() called from service,index %d",rf.me,index)
 	offsetIndex := rf.getOffset()
-	if index <= offsetIndex {
+	if index <= offsetIndex-1 {
 		return
 	}
 	// offset = 0
@@ -334,6 +335,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.snapshot.data = snapshot
 	rf.snapshot.LastIncludedIndex = index
 	rf.snapshot.LastIncludedTerm = rf.lastInstalledTerm
+	rf.commitIndex = max(rf.commitIndex,rf.lastInstalledIndex)
+	rf.lastApplied = max(rf.lastApplied,rf.lastInstalledIndex)
 	rf.persist()
 	//println("finish persisiting offset ",rf.getOffset())
 }
@@ -418,6 +421,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		(rf.votedFor == -1 && rf.AtLeastUpToDate(args.LastLogIndex, args.LastLogTerm)) {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateID
+		rf.lastHeartBeat = time.Now()
 	}
 
 	if reply.VoteGranted {
@@ -436,7 +440,16 @@ func (rf *Raft) ContainsLogEntryAt(index int, term int) bool {
 }
 
 func (rf *Raft) ApplySnapshot(msg ApplyMsg) {
-	rf.applyCh <- msg
+	select {
+		case rf.applyCh <- msg:{
+
+		}
+	default:
+		{
+
+		}
+	}
+	//rf.applyCh <- msg
 }
 
 func (rf *Raft) CheckApplyPeriodically() {
@@ -444,12 +457,13 @@ func (rf *Raft) CheckApplyPeriodically() {
 		time.Sleep(time.Duration(HeartBeatTimeout/6) * time.Millisecond)
 		rf.mu.Lock()
 		if rf.lastApplied < rf.lastInstalledIndex {
-			msg := rf.MakeSnapshotMsg()
+			msg := rf.MakeSnapshotMsg(rf.snapshot)
 			rf.mu.Unlock()
 			rf.ApplySnapshot(msg)
 			rf.mu.Lock()
 		} else {
 			rf.TryUpdateCommit()
+			//fmt.Printf("S%d: term %d commit %d offset %d lastApplied %d,log %v\n", rf.me, rf.currentTerm, rf.commitIndex, rf.getOffset(),rf.lastApplied,rf.log)
 			//Debug(dLog, "S%d: term %d commit %d offset %d lastApplied %d,log %v", rf.me, rf.currentTerm, rf.commitIndex, rf.getOffset(),rf.lastApplied,rf.log)
 			for rf.lastApplied < rf.commitIndex {
 				rf.lastApplied++
@@ -473,29 +487,31 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.mu.Lock()
 	Debug(dSnap,"S%d Snapshot received from %d",rf.me,args.LeaderID)
 	reply.Term = rf.currentTerm
-	if args.Term < rf.currentTerm {
+	if args.Term < rf.currentTerm || args.LastIncludedIndex < rf.lastInstalledIndex || (args.LastIncludedIndex == rf.lastInstalledIndex && args.LastIncludedTerm <= rf.lastInstalledTerm){
 		rf.mu.Unlock()
 		return
 	}
-	rf.snapshot.data = args.Data
-	rf.snapshot.LastIncludedTerm = args.LastIncludedTerm
-	rf.snapshot.LastIncludedIndex= args.LastIncludedIndex
+	snapshot := Snapshot{
+		LastIncludedIndex: args.LastIncludedIndex,
+		LastIncludedTerm:  args.LastIncludedTerm,
+		data:              args.Data,
+	}
 	rf.UpdateTermWithLock(args.Term, args.LeaderID, false)
-	rf.persist()
-	msg := rf.MakeSnapshotMsg()
+	msg := rf.MakeSnapshotMsg(snapshot)
 	Debug(dSnap,"S%d apply snapshot, included index %d, included term %d",rf.me,rf.snapshot.LastIncludedIndex,rf.snapshot.LastIncludedTerm)
 	rf.mu.Unlock()
 	rf.ApplySnapshot(msg)
 }
-func (rf *Raft) MakeSnapshotMsg() ApplyMsg{
+
+func (rf *Raft) MakeSnapshotMsg(snapshot Snapshot) ApplyMsg{
 	msg := ApplyMsg{
 		CommandValid:  false,
 		Command:       nil,
 		CommandIndex:  0,
 		SnapshotValid: true,
-		Snapshot:      rf.snapshot.data,
-		SnapshotTerm:  rf.snapshot.LastIncludedTerm,
-		SnapshotIndex: rf.snapshot.LastIncludedIndex,
+		Snapshot:      snapshot.data,
+		SnapshotTerm:  snapshot.LastIncludedTerm,
+		SnapshotIndex: snapshot.LastIncludedIndex,
 	}
 	return msg
 }
@@ -508,13 +524,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.XTerm = -1
 	reply.XIndex = -1
 	reply.XLen = len(rf.log)
-	// reset election timer
-	rf.lastHeartBeat = time.Now()
-
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		return
 	}
+
+	// reset election timer
+	rf.lastHeartBeat = time.Now()
 
 	if !rf.ContainsLogEntryAt(args.PrevLogIndex, args.PrevLogTerm) {
 		reply.Success = false
@@ -678,6 +694,7 @@ func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
 	rf.mu.Lock()
+	//fmt.Printf("Server %d log %v",rf.me,rf.log)
 	Debug(dDrop, "S%d: killed,with log %v commit %d", rf.me, rf.log, rf.commitIndex)
 	rf.mu.Unlock()
 }
@@ -762,8 +779,9 @@ func (rf *Raft) startElection() {
 	cond := sync.NewCond(&mu)
 	lastLogIndex := rf.getLastIndex()
 	lastLogTerm := rf.getLastTerm()
+	currentTerm := rf.currentTerm
 	args := &RequestVoteArgs{
-		Term:         rf.currentTerm,
+		Term:         currentTerm,
 		CandidateID:  rf.me,
 		LastLogIndex: lastLogIndex,
 		LastLogTerm:  lastLogTerm,
@@ -777,11 +795,12 @@ func (rf *Raft) startElection() {
 				Debug(dVote, "S%d: sending RequestVote to %d", rf.me, peerID)
 				ok := rf.sendRequestVote(peerID, args, reply)
 				rf.mu.Lock()
+				currentTerm2 := rf.currentTerm
 				rf.UpdateTermWithLock(reply.Term, peerID, true)
 				rf.mu.Unlock()
 				mu.Lock()
 				defer mu.Unlock()
-				if ok && reply.VoteGranted {
+				if ok && reply.VoteGranted && currentTerm == currentTerm2{
 					count++
 				}
 				finished++
@@ -808,6 +827,8 @@ func (rf *Raft) startElection() {
 	rf.mu.Lock()
 	Debug(dVote, "S%d: vote count %d", rf.me, votedCount)
 	if votedCount >= rf.majority() && rf.state == Candidate {
+		fmt.Printf("S%d elected as leader\n",rf.me)
+		fmt.Printf("with log %v\n",rf.log)
 		Debug(dLeader, "S%d: become leader for term %d", rf.me, rf.currentTerm)
 		rf.state = Leader
 		// update nextIndex and matchIndex
@@ -859,9 +880,9 @@ func (rf *Raft) SendAppendEntriesTo(peerID int) {
 	Debug(dSnap,"S%d,nextIndex to %d is %d, offset is %d",rf.me,peerID,rf.nextIndex[peerID],rf.getOffset())
 	prevLogIndex := rf.nextIndex[peerID] - 1
 	prevLogTerm := rf.getTermAt(prevLogIndex)
-
+	currentTerm := rf.currentTerm
 	args := &AppendEntriesArgs{
-		Term:         rf.currentTerm,
+		Term:         currentTerm,
 		LeaderId:     rf.me,
 		PrevLogIndex: prevLogIndex,
 		PrevLogTerm:  prevLogTerm,
@@ -872,12 +893,19 @@ func (rf *Raft) SendAppendEntriesTo(peerID int) {
 	reply := &AppendEntriesReply{}
 	Debug(dLog, "S%d: sending AppendEntries to S%d, log %v, prevLogIndex %d,prevLogTerm %d",
 		rf.me, peerID, entries, prevLogIndex, prevLogTerm)
+	if len(entries) != 0 {
+		//fmt.Printf("sending entries %v to S%d\n",entries,peerID)
+	}
 	ok := rf.sendAppendEntries(peerID, args, reply)
 	rf.mu.Lock()
 	if !ok {
 		return
 	}
+	if rf.currentTerm != currentTerm {
+		return
+	}
 	if reply.Success {
+		//fmt.Printf("appendEntries to S%d OK\n",peerID)
 		Debug(dLog2, "S%d: AppendEntries to S%d succeeded", rf.me, peerID)
 		rf.nextIndex[peerID] = prevLogIndex + len(entries) + 1
 		rf.matchIndex[peerID] = prevLogIndex + len(entries)
@@ -903,8 +931,9 @@ func (rf *Raft) SendAppendEntriesTo(peerID int) {
 }
 
 func (rf *Raft) SendSnapshotTo(peerID int) {
+	currentTerm := rf.currentTerm
 	args := &InstallSnapshotArgs{
-		Term:              rf.currentTerm,
+		Term:              currentTerm,
 		LeaderID:          rf.me,
 		LastIncludedIndex: rf.snapshot.LastIncludedIndex,
 		LastIncludedTerm:  rf.snapshot.LastIncludedTerm,
@@ -917,6 +946,9 @@ func (rf *Raft) SendSnapshotTo(peerID int) {
 	rf.mu.Lock()
 	if !ok {
 		Debug(dSnap,"S%d: snapshot fail to reach S%d",rf.me,peerID)
+		return
+	}
+	if rf.currentTerm != currentTerm {
 		return
 	}
 	// it doesn't matter if snapshot is refused by peer
@@ -1059,6 +1091,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	})
 
 	rf.readPersist(persister.ReadRaftState())
+	fmt.Printf("s%d log%v snapshot offset %d",rf.me,rf.log,rf.getOffset())
 	// initialize nextIndex and matchIndex to ideal length
 	rf.InitNextAndMatch()
 	// start ticker goroutine to start elections

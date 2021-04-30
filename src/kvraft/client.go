@@ -2,9 +2,14 @@ package kvraft
 
 import (
 	"6.824/labrpc"
+	"fmt"
+	"time"
+
+	//"fmt"
 	"sync"
 )
-var objCnt int = 0
+var objCnt int = 1
+var mu      sync.Mutex
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
@@ -12,6 +17,7 @@ type Clerk struct {
 	leaderID int
 	lastOKCommandID int64
 	counter int
+	getCounter int
 	me 		int
 	mu      sync.Mutex
 }
@@ -23,8 +29,11 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck.leaderID = 0
 	ck.lastOKCommandID = -1
 	ck.counter = 0
+	ck.getCounter = 2147483647
+	mu.Lock()
 	ck.me = objCnt
 	objCnt++
+	mu.Unlock()
 	return ck
 }
 
@@ -50,7 +59,7 @@ func (ck *Clerk) GetNextCounter() int{
 //
 
 func (ck *Clerk) Get(key string) string {
-	commandID := ck.GetNextCounter()
+	commandID := ck.GetNextGetCounter()
 	args := &GetArgs{
 		Key: key,
 		CommandID: commandID,
@@ -59,6 +68,7 @@ func (ck *Clerk) Get(key string) string {
 	for true {
 		for ID := ck.leaderID; ID != ck.leaderID + len(ck.servers); ID++ {
 			serverID := ID % len(ck.servers)
+			fmt.Printf("Send Get %s to S%d\n",key,serverID)
 			DPrintf("Send Get %s to S%d",key,serverID)
 			reply := &GetReply{}
 			ok := ck.servers[serverID].Call("KVServer.Get", args, reply)
@@ -66,6 +76,7 @@ func (ck *Clerk) Get(key string) string {
 				switch reply.Err {
 				case OK:
 					{
+						fmt.Printf("%d Receive %s from S%d\n",ck.me,reply.Value,serverID)
 						ck.leaderID = serverID
 						return reply.Value
 					}
@@ -77,6 +88,7 @@ func (ck *Clerk) Get(key string) string {
 				}
 			}
 		}
+		time.Sleep(time.Duration(600) * time.Millisecond)
 	}
 	panic("code should not reach here")
 	return ""
@@ -95,6 +107,8 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
 	commandID := ck.GetNextCounter()
+
+	//fmt.Printf("client %d commandID %d\n",ck.me,commandID)
 	args := &PutAppendArgs{
 		Key:   key,
 		Value: value,
@@ -105,19 +119,24 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	for true {
 		for ID := ck.leaderID; ID != ck.leaderID + len(ck.servers); ID++ {
 			serverID := ID % len(ck.servers)
+			//fmt.Printf("Send PutAppend key:%s Value%s to S%d\n",key,value,serverID)
 			DPrintf("Send PutAppend key:%s Value%s to S%d",key,value,serverID)
 			reply := &PutAppendReply{}
 			ok := ck.servers[serverID].Call("KVServer.PutAppend", args, reply)
 			if ok {
-				DPrintf("Receive %s from S%d",reply.Err,serverID)
 				if reply.Err == OK {
+					//fmt.Printf("%d Receive %s from S%d commandID%d\n",ck.me,reply.Err,serverID,commandID)
 					ck.leaderID = serverID
 					return
 				} else {
+					if reply.Err == ErrWrongLeader {
+						fmt.Printf("wrong leader S%d\n",serverID)
+					}
 					continue
 				}
 			}
 		}
+		time.Sleep(time.Duration(600) * time.Millisecond)
 	}
 	panic("code should not reach here")
 }
@@ -125,6 +144,15 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 func (ck *Clerk) Put(key string, value string) {
 	ck.PutAppend(key, value, "Put")
 }
+
 func (ck *Clerk) Append(key string, value string) {
 	ck.PutAppend(key, value, "Append")
+}
+
+func (ck *Clerk) GetNextGetCounter() int {
+	ck.mu.Lock()
+	ret := ck.getCounter
+	ck.getCounter--
+	ck.mu.Unlock()
+	return ret
 }
