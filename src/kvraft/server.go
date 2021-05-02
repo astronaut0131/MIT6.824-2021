@@ -99,6 +99,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		kv.mu.Unlock()
 		return
 	} else {
+		fmt.Printf("server %d start %v term %d\n",kv.me,op,term)
 		kv.chanMap[combineID] = ch
 	}
 	kv.mu.Unlock()
@@ -162,6 +163,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		kv.mu.Unlock()
 		return
 	} else {
+		fmt.Printf("server %d start %v term %d\n",kv.me,op,term)
 		kv.chanMap[combineID] = ch
 	}
 	kv.mu.Unlock()
@@ -224,6 +226,9 @@ func (kv *KVServer) Apply() {
 			kv.mu.Unlock()
 		}
 		if msg.CommandValid {
+			if msg.Command == nil {
+				continue
+			}
 			op, assertOk := msg.Command.(Op)
 			if !assertOk {
 				panic("invalid command")

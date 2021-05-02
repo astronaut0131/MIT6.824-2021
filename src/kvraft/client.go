@@ -68,7 +68,7 @@ func (ck *Clerk) Get(key string) string {
 	for true {
 		for ID := ck.leaderID; ID != ck.leaderID + len(ck.servers); ID++ {
 			serverID := ID % len(ck.servers)
-			fmt.Printf("Send Get %s to S%d\n",key,serverID)
+			//fmt.Printf("Send Get %s to S%d\n",key,serverID)
 			DPrintf("Send Get %s to S%d",key,serverID)
 			reply := &GetReply{}
 			ok := ck.servers[serverID].Call("KVServer.Get", args, reply)
@@ -76,7 +76,7 @@ func (ck *Clerk) Get(key string) string {
 				switch reply.Err {
 				case OK:
 					{
-						fmt.Printf("%d Receive %s from S%d\n",ck.me,reply.Value,serverID)
+						//fmt.Printf("%d Receive %s from S%d\n",ck.me,reply.Value,serverID)
 						ck.leaderID = serverID
 						return reply.Value
 					}
