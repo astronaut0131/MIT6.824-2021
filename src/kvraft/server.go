@@ -5,11 +5,10 @@ import (
 	"6.824/labrpc"
 	"6.824/raft"
 	"bytes"
-	"fmt"
+	//"fmt"
 
 	//"fmt"
 
-	//"//fmt"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -66,7 +65,6 @@ type KVServer struct {
 
 	maxClientCommandID	map[int]int
 	persister 	*raft.Persister
-	hasSnapshot	bool
 }
 
 func (kv *KVServer) CombineID(clientID int,commandID int) int64{
@@ -93,14 +91,18 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Lock()
 
 	_, term, isLeader := kv.rf.Start(op)
+	ch,ok := kv.chanMap[combineID]
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		reply.Value = ""
 		kv.mu.Unlock()
 		return
 	} else {
-		fmt.Printf("server %d start %v term %d\n",kv.me,op,term)
-		kv.chanMap[combineID] = ch
+		//fmt.Printf("server %d start %v term %d\n",kv.me,op,term)
+		if !ok {
+			ch = make(chan OpResult)
+			kv.chanMap[combineID] = ch
+		}
 	}
 	kv.mu.Unlock()
 
@@ -145,7 +147,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 
 	combineID := kv.CombineID(args.ClientID,args.CommandID)
-	ch := make(chan OpResult)
 	kv.mu.Lock()
 	maxCommandID,ok := kv.maxClientCommandID[args.ClientID]
 	if !ok {
@@ -158,13 +159,17 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 	_, term, isLeader := kv.rf.Start(op)
+	ch,ok := kv.chanMap[combineID]
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		kv.mu.Unlock()
 		return
 	} else {
-		fmt.Printf("server %d start %v term %d\n",kv.me,op,term)
-		kv.chanMap[combineID] = ch
+		//fmt.Printf("server %d start %v term %d\n",kv.me,op,term)
+		if !ok {
+			ch = make(chan OpResult)
+			kv.chanMap[combineID] = ch
+		}
 	}
 	kv.mu.Unlock()
 	select {
@@ -201,7 +206,7 @@ func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
 	// Your code here, if desired.
-	fmt.Printf("kill %d\n",kv.me)
+	//fmt.Printf("kill %d\n",kv.me)
 }
 
 func (kv *KVServer) killed() bool {
@@ -217,12 +222,11 @@ func (kv *KVServer) Apply() {
 		// check whether to generate a snapshot
 		if kv.rf != nil && kv.maxraftstate != -1 && kv.persister.RaftStateSize() >= kv.maxraftstate {
 			kv.mu.Lock()
-			fmt.Printf("S%d start snapshot with index %d\n", kv.me, msg.CommandIndex-1)
+			//fmt.Printf("S%d start snapshot with index %d\n", kv.me, msg.CommandIndex-1)
 			lastIndex := msg.CommandIndex - 1
 			data := kv.genSnapshot()
 			DPrintf("S%d making snapshot, with index %d",kv.me,lastIndex)
 			kv.rf.Snapshot(lastIndex,data)
-			kv.hasSnapshot = true
 			kv.mu.Unlock()
 		}
 		if msg.CommandValid {
@@ -242,9 +246,9 @@ func (kv *KVServer) Apply() {
 			}
 			combineID := kv.CombineID(op.ClientID,op.CommandID)
 			ch, hasCh := kv.chanMap[combineID]
-			if op.ServerID != kv.me {
-				hasCh = false
-			}
+			//if op.ServerID != kv.me {
+			//	hasCh = false
+			//}
 			var opResult OpResult
 			opResult.Error = ErrFailed
 			opResult.Value = ""
@@ -253,7 +257,7 @@ func (kv *KVServer) Apply() {
 				if ok {
 					opResult.Error = OK
 					opResult.Value = value
-					fmt.Printf("server %d executing GET %s from client %d,result %s\n", kv.me, op.Key, op.ClientID, value)
+					//fmt.Printf("server %d executing GET %s from client %d,result %s\n", kv.me, op.Key, op.ClientID, value)
 				} else {
 					opResult.Error = ErrNoKey
 					opResult.Value = ""
@@ -261,13 +265,13 @@ func (kv *KVServer) Apply() {
 			} else {
 				if op.CommandID >= maxCommandID {
 					value, ok := kv.kvMap[op.Key]
-					if op.OpType == APPEND {
-						fmt.Printf("server %d append key %s value %s opCommandID %d maxCommandID %d from client %d\n",
-							kv.me, op.Key, op.Value, op.CommandID, maxCommandID,op.ClientID)
-					} else {
-						fmt.Printf("server %d put key %s value %s opCommandID %d maxCommandID %d from client %d\n",
-							kv.me, op.Key, op.Value, op.CommandID, maxCommandID,op.ClientID)
-					}
+					//if op.OpType == APPEND {
+					//	fmt.Printf("server %d append key %s value %s opCommandID %d maxCommandID %d from client %d\n",
+					//		kv.me, op.Key, op.Value, op.CommandID, maxCommandID,op.ClientID)
+					//} else {
+					//	fmt.Printf("server %d put key %s value %s opCommandID %d maxCommandID %d from client %d\n",
+					//		kv.me, op.Key, op.Value, op.CommandID, maxCommandID,op.ClientID)
+					//}
 					if !ok {
 						kv.kvMap[op.Key] = op.Value
 					} else {
@@ -278,16 +282,16 @@ func (kv *KVServer) Apply() {
 						}
 					}
 					kv.maxClientCommandID[op.ClientID] = op.CommandID + 1
-					fmt.Printf("server %d maxCliendCommandID %d update to %d\n",kv.me,op.ClientID,op.CommandID + 1)
+					//fmt.Printf("server %d maxCliendCommandID %d update to %d\n",kv.me,op.ClientID,op.CommandID + 1)
 					opResult.Error = OK
 				} else {
-					if op.OpType == APPEND {
-						fmt.Printf("server %d skip append %s %s opCommandID %d maxCommandID %d from client %d\n",
-							kv.me,op.Key,op.Value,op.CommandID,maxCommandID,op.ClientID)
-					} else {
-						fmt.Printf("server %d skip put %s %s opCommandID %d maxCommandID %d from client %d\n",
-							kv.me,op.Key,op.Value,op.CommandID,maxCommandID,op.ClientID)
-					}
+					//if op.OpType == APPEND {
+					//	fmt.Printf("server %d skip append %s %s opCommandID %d maxCommandID %d from client %d\n",
+					//		kv.me,op.Key,op.Value,op.CommandID,maxCommandID,op.ClientID)
+					//} else {
+					//	fmt.Printf("server %d skip put %s %s opCommandID %d maxCommandID %d from client %d\n",
+					//		kv.me,op.Key,op.Value,op.CommandID,maxCommandID,op.ClientID)
+					//}
 				}
 			}
 			kv.mu.Unlock()
@@ -312,7 +316,7 @@ func (kv *KVServer) Apply() {
 				if decoder.Decode(&kv.maxClientCommandID) != nil  || decoder.Decode(&kv.kvMap) != nil {
 					panic("decode failed in server")
 				} else {
-					fmt.Printf("server %d, kvmap %v\n maxCommandID%v\n",kv.me,kv.kvMap,kv.maxClientCommandID)
+					//fmt.Printf("server %d, kvmap %v\n maxCommandID%v\n",kv.me,kv.kvMap,kv.maxClientCommandID)
 				}
 				kv.mu.Unlock()
 			}
@@ -360,7 +364,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
-	fmt.Printf("start %d\n",kv.me)
+	//fmt.Printf("start %d\n",kv.me)
 	// You may need initialization code here.
 	// read the snapshot and recover
 

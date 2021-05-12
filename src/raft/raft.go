@@ -76,9 +76,9 @@ func getVerbosity() int {
 			log.Fatalf("Invalid verbosity %v", v)
 		}
 	}
-	//if level != 0 {
-	//	level = 0
-	//}
+	if level != 0 {
+		level = 0
+	}
 	return level
 }
 
@@ -264,7 +264,7 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	// Your code here (2D).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	fmt.Printf("S%d CondInstallSnapshot called,included index %d,included term %d\n", rf.me, lastIncludedIndex, lastIncludedTerm)
+	//fmt.Printf("S%d CondInstallSnapshot called,included index %d,included term %d\n", rf.me, lastIncludedIndex, lastIncludedTerm)
 	Debug(dSnap, "S%d CondInstallSnapshot called,included index %d,included term %d", rf.me, lastIncludedIndex, lastIncludedTerm)
 	// if Raft has processed entries after
 	// the snapshot's LastIncludedTerm/LastIncludedIndex
@@ -828,8 +828,8 @@ func (rf *Raft) startElection() {
 	rf.mu.Lock()
 	Debug(dVote, "S%d: vote count %d", rf.me, votedCount)
 	if votedCount >= rf.majority() && rf.state == Candidate {
-		fmt.Printf("S%d elected as leader,term %d\n",rf.me,rf.currentTerm)
-		fmt.Printf("with log %v\n",rf.log)
+		//fmt.Printf("S%d elected as leader,term %d\n",rf.me,rf.currentTerm)
+		//fmt.Printf("with log %v\n",rf.log)
 		Debug(dLeader, "S%d: become leader for term %d", rf.me, rf.currentTerm)
 		rf.state = Leader
 		// update nextIndex and matchIndex
@@ -1092,8 +1092,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	})
 
 	rf.readPersist(persister.ReadRaftState())
-	fmt.Printf("s%d log%v snapshot offset %d lastInstalledIndex %d, lastInstalledTerm %d\n",rf.me,rf.log,rf.getOffset(),
-		rf.lastInstalledIndex,rf.lastInstalledTerm)
+	//fmt.Printf("s%d log%v snapshot offset %d lastInstalledIndex %d, lastInstalledTerm %d\n",rf.me,rf.log,rf.getOffset(),
+	//	rf.lastInstalledIndex,rf.lastInstalledTerm)
 	// initialize nextIndex and matchIndex to ideal length
 	rf.InitNextAndMatch()
 	// start ticker goroutine to start elections

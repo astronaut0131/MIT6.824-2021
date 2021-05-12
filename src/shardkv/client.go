@@ -8,11 +8,18 @@ package shardkv
 // talks to the group that holds the key's shard.
 //
 
-import "6.824/labrpc"
+import (
+	"6.824/labrpc"
+	"sync"
+)
 import "crypto/rand"
 import "math/big"
 import "6.824/shardctrler"
 import "time"
+
+
+var globalClientID int = 0
+var globalLock sync.Mutex
 
 //
 // which shard is a key in?
@@ -40,6 +47,8 @@ type Clerk struct {
 	config   shardctrler.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+	clientID int
+	commandID int
 }
 
 //
@@ -56,7 +65,19 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.sm = shardctrler.MakeClerk(ctrlers)
 	ck.make_end = make_end
 	// You'll have to add code here.
+
+	globalLock.Lock()
+	ck.clientID = globalClientID
+	globalClientID++
+	globalLock.Unlock()
+	ck.commandID = 0
 	return ck
+}
+
+func (ck *Clerk) getNextCommandID() int{
+	nextCommandID := ck.commandID
+	ck.commandID++
+	return nextCommandID
 }
 
 //
@@ -68,9 +89,12 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 func (ck *Clerk) Get(key string) string {
 	args := GetArgs{}
 	args.Key = key
-
+	args.CommandID = ck.getNextCommandID()
+	args.ClientID = ck.clientID
+	Debug(dInfo,"client %d start get %s shard %d",args.ClientID,key,key2shard(key))
 	for {
 		shard := key2shard(key)
+		args.ShardID = shard
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
@@ -79,7 +103,13 @@ func (ck *Clerk) Get(key string) string {
 				var reply GetReply
 				ok := srv.Call("ShardKV.Get", &args, &reply)
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+					Debug(dInfo,"client %d end get %s,with value %s",args.ClientID,key,reply.Value)
 					return reply.Value
+				}
+				if !ok {
+					Debug(dInfo,"client %d timeout for get %s",args.ClientID,key)
+				} else {
+					Debug(dInfo, "client %d receive %v for get %s", args.ClientID, reply.Err,key)
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
 					break
@@ -105,9 +135,13 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args.Value = value
 	args.Op = op
 
+	args.CommandID = ck.getNextCommandID()
+	args.ClientID = ck.clientID
 
+	Debug(dInfo,"client %d start PutAppend %s %s shard %d",args.ClientID,key,value,key2shard(key))
 	for {
 		shard := key2shard(key)
+		args.ShardID = shard
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
 			for si := 0; si < len(servers); si++ {
@@ -115,7 +149,13 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				var reply PutAppendReply
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
 				if ok && reply.Err == OK {
+					Debug(dInfo,"client %d end PutAppend %s %s",args.ClientID,key,value)
 					return
+				}
+				if !ok {
+					Debug(dInfo,"client %d timeout for PutAppend %s %s",args.ClientID,key,value)
+				} else {
+					Debug(dInfo, "client %d receive %v for PutAppend %s %s", args.ClientID, reply.Err,key,value)
 				}
 				if ok && reply.Err == ErrWrongGroup {
 					break

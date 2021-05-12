@@ -2,7 +2,7 @@ package kvraft
 
 import (
 	"6.824/labrpc"
-	"fmt"
+	//"fmt"
 	"time"
 
 	//"fmt"
@@ -130,7 +130,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 					return
 				} else {
 					if reply.Err == ErrWrongLeader {
-						fmt.Printf("wrong leader S%d\n",serverID)
+						//fmt.Printf("wrong leader S%d\n",serverID)
 					}
 					continue
 				}
