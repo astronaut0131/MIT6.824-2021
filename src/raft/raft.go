@@ -311,7 +311,11 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	defer rf.mu.Unlock()
 	Debug(dSnap,"S%d Snapshot() called from service,index %d",rf.me,index)
 	offsetIndex := rf.getOffset()
-	if index <= offsetIndex-1 {
+	if index < offsetIndex-1 {
+		return
+	} else if index == offsetIndex-1 {
+		rf.snapshot.data = snapshot
+		rf.persist()
 		return
 	}
 	// offset = 0

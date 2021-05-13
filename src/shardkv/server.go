@@ -70,10 +70,11 @@ type ShardKV struct {
 	maxClientCommandID map[int]int
 	persister          *raft.Persister
 
-	kvMap                map[string]string
-	config               shardctrler.Config
-	configCond           *sync.Cond
-	newConfig			 *sync.Cond
+	kvMap            map[string]string
+	config           shardctrler.Config
+	configCond       *sync.Cond
+	newConfig        *sync.Cond
+	lastMsgIndex	 int
 }
 
 func (kv *ShardKV) CombineID(clientID int, commandID int) int64 {
@@ -196,24 +197,29 @@ func (kv *ShardKV) migrateShards(oldShards []int, newShards []int, newConfig sha
 	// switch to new shards
 	shardDestinationMap := kv.getShardsDestination(oldShards,newShards,newConfig)
 	kv.removeMovedShards(newShards)
-	keysToDel := make([]string,0)
 	maxClientCommand := make(map[int]int)
 	for client,id := range kv.maxClientCommandID {
 		maxClientCommand[client] = id
 	}
+	//keysToDel := make([]string,0)
 	for shard,destination := range shardDestinationMap {
 		shardMap := make(map[string]string)
 		for k,v := range kv.kvMap {
 			if key2shard(k) == shard {
 				shardMap[k] = v
-				keysToDel = append(keysToDel,k)
+				//keysToDel = append(keysToDel, k)
 			}
 		}
-		go kv.sendShardTo(shard,shardMap,newConfig.Num,destination,maxClientCommand)
+		if len(destination) != 0 {
+			go kv.sendShardTo(shard, shardMap, newConfig.Num, destination, maxClientCommand)
+		}
 	}
-	for _,key := range keysToDel {
-		delete(kv.kvMap,key)
-	}
+	//for _,key := range keysToDel {
+	//	delete(kv.kvMap,key)
+	//}
+	//if len(keysToDel) != 0{
+	//	kv.doSnapshotWithLock()
+	//}
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
@@ -403,20 +409,48 @@ func (kv *ShardKV) configurationWatcher() {
 		kv.mu.Unlock()
 		newConfig := kv.mck.Query(nextConfigNum)
 		newShards := kv.getShardsFromConfig(newConfig)
+		shouldSnapshot := false
 		if newConfig.Num == nextConfigNum {
 			kv.newConfig.Broadcast()
 			Debug(dInfo,"gid %d server %d found new config %v",kv.gid,kv.me,newConfig)
 			go kv.ConfigurationChange(newConfig)
 			kv.mu.Lock()
-			for kv.config.Num == newConfig.Num - 1&& !kv.isSameShardingArray(kv.shards,newShards) {
+			for kv.config.Num == newConfig.Num - 1 && !kv.isSameShardingArray(kv.shards,newShards) {
 				kv.configCond.Wait()
 				Debug(dInfo,"gid %d server %d shards %v target shards %v target Num %d",kv.gid,kv.me,kv.shards,newShards,newConfig.Num)
 			}
+			// in case of snapshot
 			if kv.config.Num == newConfig.Num - 1 {
 				kv.config = newConfig
 			}
-			Debug(dInfo,"gid %d server %d config index update to %d",kv.gid,kv.me,kv.config.Num)
+			keysToDel := make([]string,0)
+			for k,_ := range kv.kvMap {
+				shouldDelete := true
+				for _,shard := range kv.shards {
+					if key2shard(k) == shard {
+						shouldDelete = false
+						break
+					}
+				}
+				if shouldDelete {
+					keysToDel = append(keysToDel,k)
+				}
+			}
+			for _,k := range keysToDel {
+				delete(kv.kvMap,k)
+			}
+			if len(keysToDel) != 0 {
+				shouldSnapshot = true
+			}
+			shards := make([]int,0)
+			for k,_ := range kv.kvMap {
+				shards = append(shards,key2shard(k))
+			}
+			Debug(dInfo,"gid %d server %d config index update to %d new shards %v actual kv shards %v",kv.gid,kv.me,kv.config.Num,kv.shards,shards)
 			kv.mu.Unlock()
+		}
+		if shouldSnapshot {
+			kv.doSnapshot()
 		}
 		time.Sleep(time.Duration(watchTimeout) * time.Millisecond)
 	}
@@ -432,10 +466,11 @@ func (kv *ShardKV) genSnapshot() []byte {
 	encoder.Encode(kv.config.Groups)
 	encoder.Encode(kv.shards)
 	data := buffer.Bytes()
+
 	return data
 }
 
-func (kv *ShardKV) handleGetPutAppend(op Op) {
+func (kv *ShardKV) handleGetPutAppend(op Op,commandIndex int) {
 	kv.mu.Lock()
 	maxCommandID := kv.maxClientCommandID[op.ClientID]
 	combineID := kv.CombineID(op.ClientID, op.CommandID)
@@ -478,6 +513,7 @@ func (kv *ShardKV) handleGetPutAppend(op Op) {
 			}
 		}
 	}
+	kv.lastMsgIndex = commandIndex
 	kv.mu.Unlock()
 	if hasCh {
 		select {
@@ -493,10 +529,14 @@ func (kv *ShardKV) handleGetPutAppend(op Op) {
 	}
 }
 
-func (kv *ShardKV) doSnapshot(lastIndex int) {
+func (kv *ShardKV) doSnapshot() {
 	kv.mu.Lock()
-	data := kv.genSnapshot()
-	kv.rf.Snapshot(lastIndex, data)
+	if kv.rf != nil && kv.maxraftstate != -1 {
+		lastIndex := kv.lastMsgIndex
+		data := kv.genSnapshot()
+		Debug(dInfo, "gid %d server %d snapshot with Num %d size %d index %d", kv.gid, kv.me, kv.config.Num, len(data), lastIndex)
+		kv.rf.Snapshot(lastIndex, data)
+	}
 	kv.mu.Unlock()
 }
 
@@ -504,9 +544,6 @@ func (kv *ShardKV) Applier() {
 	for msg := range kv.applyCh {
 		if kv.killed() {
 			break
-		}
-		if kv.rf != nil && kv.maxraftstate != -1 && kv.persister.RaftStateSize() >= kv.maxraftstate {
-			kv.doSnapshot(msg.CommandIndex - 1)
 		}
 		if msg.CommandValid {
 			// ignore no-op
@@ -519,16 +556,19 @@ func (kv *ShardKV) Applier() {
 			}
 
 			if op.OpType == ConfigurationChange {
-				kv.handleConfigurationChange(op)
+				kv.handleConfigurationChange(op,msg.CommandIndex)
 			} else if op.OpType == Migration {
-				kv.handleMigration(op)
+				kv.handleMigration(op,msg.CommandIndex)
 			} else {
-				kv.handleGetPutAppend(op)
+				kv.handleGetPutAppend(op,msg.CommandIndex)
 			}
 		} else if msg.SnapshotValid {
 			if kv.rf.CondInstallSnapshot(msg.SnapshotTerm, msg.SnapshotIndex, msg.Snapshot) {
 				kv.switchToSnapshot(msg.Snapshot)
 			}
+		}
+		if  kv.persister.RaftStateSize() >= kv.maxraftstate {
+			kv.doSnapshot()
 		}
 	}
 }
@@ -549,6 +589,9 @@ func (kv *ShardKV) getShardsDestination(oldShards[]int, newShards []int, c shard
 				for _, destination := range c.Groups[c.Shards[shard]] {
 					ends = append(ends,kv.make_end(destination))
 				}
+				shardsDestination[shard] = ends
+			} else {
+				ends := make([]*labrpc.ClientEnd,0)
 				shardsDestination[shard] = ends
 			}
 		}
@@ -591,7 +634,7 @@ func (kv *ShardKV) appendZeroOriginShards(newShards []int) {
 	}
 }
 
-func (kv *ShardKV) handleConfigurationChange(op Op) {
+func (kv *ShardKV) handleConfigurationChange(op Op,commandIndex int) {
 	kv.mu.Lock()
 	Debug(dInfo,"gid %d server %d handle configuration change, new config %d cur config %d",kv.gid,kv.me, op.NewConfig.Num,kv.config.Num)
 	for op.CommandID > kv.config.Num + 1 {
@@ -606,6 +649,7 @@ func (kv *ShardKV) handleConfigurationChange(op Op) {
 		kv.migrateShards(kv.shards,newShards,op.NewConfig)
 		kv.configCond.Broadcast()
 	}
+	kv.lastMsgIndex = commandIndex
 	kv.mu.Unlock()
 	if hasCh {
 		select {
@@ -636,6 +680,7 @@ func (kv *ShardKV) switchToSnapshot(snapshot []byte) {
 	kv.config.Num = Num
 	kv.config.Shards = shards
 	kv.config.Groups = groups
+	Debug(dInfo,"gid %d server %d switch to snapshot with Num %d shards %d",kv.gid,kv.me,Num,kv.shards)
 	kv.configCond.Broadcast()
 	kv.mu.Unlock()
 }
@@ -683,7 +728,7 @@ func (kv *ShardKV) sendShardTo(shard int, shardMap map[string]string,configNum i
 	Debug(dInfo,"gid %d server %d send shard %d oookkk",kv.gid,kv.me,shard)
 }
 
-func (kv *ShardKV) handleMigration(op Op) {
+func (kv *ShardKV) handleMigration(op Op,commandIndex int) {
 	kv.mu.Lock()
 	Debug(dInfo,"gid %d server %d handle migration, new config %d, shard %d",kv.gid,kv.me,op.CommandID, op.Shard)
 	combineID := kv.CombineID(internalMigrationID, op.CommandID)
@@ -718,6 +763,7 @@ func (kv *ShardKV) handleMigration(op Op) {
 		}
 		kv.configCond.Broadcast()
 	}
+	kv.lastMsgIndex = commandIndex
 	kv.mu.Unlock()
 	if hasCh {
 		select {
@@ -805,6 +851,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.newConfig = sync.NewCond(&kv.mu)
 	kv.maxClientCommandID[internalMigrationID] = 1
 	kv.maxClientCommandID[internalConfigurationChangeID] = 1
+	kv.lastMsgIndex = 0
 	go kv.Applier()
 	go kv.configurationWatcher()
 	return kv
